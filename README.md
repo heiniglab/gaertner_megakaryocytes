@@ -5,4 +5,5 @@ This repository contains all code to reproduce results of the RNA-seq and scRNA-
 
 Gärtner *et al.* **Plasmacytoid dendritic cells regulate tissue homeostasis of megakaryocytes**
 
+The dependencies of the script are presented in renv.lock file
 
