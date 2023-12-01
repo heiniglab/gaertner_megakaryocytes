@@ -34,7 +34,7 @@ Inside the R console (in the project directory), run the following command to re
 ```{R}
 renv::restore()
 ```
-This command will install all the R packages specified in the renv.lock file.
+This command will install all the R packages specified in the renv.lock file. Installation time: 30-45min
 
 
 # Tutorial
