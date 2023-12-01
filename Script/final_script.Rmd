@@ -1,0 +1,1073 @@
+---
+title: "Gärtner et al. Plasmacytoid dendritic cells regulate tissue homeostasis of megakaryocytes"
+author: "Visha"
+date: "13/10/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+#Gärtner et al. Plasmacytoid dendritic cells regulate tissue homeostasis of megakaryocytes
+
+```{r reading_in_data, echo=TRUE}
+library(SoupX)
+library(dplyr)
+library(patchwork)
+library(sctransform)
+library(ggplot2)
+library(dittoSeq)
+library(RColorBrewer)
+library(data.table)
+library(magrittr)
+library(readxl)
+library(reshape2)
+library(enrichR)
+library(Seurat)
+library(clusterProfiler)
+library(stringr)
+library(EnhancedVolcano)
+library(monocle3)
+library(dittoSeq)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(circlize)
+
+
+```
+
+### implementing SoupX to reduce ambient RNA content and reading in input matrices. The soup contamination factor was set to 0.1 to remove 95-98% of the contamination caused by ambient RNA. The high ambient RNA content was discovered when 10x cell ranger pipeline was run on the raw 10x reads.
+```{r soupx, echo=TRUE}
+# Load data and estimate soup profile
+sc = load10X("~/Downloads/outs/")
+# seeting the fraction to 0.1 to remove 90% of ambient RNA content
+sc = setContaminationFraction(sc, 0.1)
+# Clean the data
+out = adjustCounts(sc, roundToInt=TRUE)
+
+# reading the raw feature matrix
+foldername = dirname(Sys.glob("~/Downloads/outs/raw_feature_bc_matrix/*.mtx.gz"))
+h5file = Read10X(foldername,unique.features = TRUE)
+samplename = "MKP3"
+allfiles.raw = list()
+allABs.raw = list()
+
+allfiles.raw[[samplename]] = h5file$`Gene Expression`
+allABs.raw[[samplename]] = h5file$`Antibody Capture`
+
+allfiles.raw$MKP3 <- out
+joint.bcs <- intersect(colnames(allfiles.raw$MKP3), colnames(allABs.raw$MKP3))
+allfiles.raw$MKP3 <- allfiles.raw$MKP3[, joint.bcs]
+allABs.raw$MKP3 <- as.matrix(allABs.raw$MKP3[, joint.bcs])
+
+print("conditions")
+rownames(allABs.raw$MKP3)
+
+```
+
+### filtering data based on the cutoffs: nFeature_RNA > 250 & nFeature_RNA < 6000 & nCount_RNA > 400 & nCount_RNA < 20000 & percent.mt < 5. we also removed the ribosomal genes from the data.
+```{r filtering, echo=TRUE}
+MKP3 <- CreateSeuratObject(counts = allfiles.raw$MKP3, project = "MKP3", min.cells = 3, min.features = 200)
+str(MKP3)
+
+### removing ribosomal genes from the data and calculating the percentage of mitochondrial genes
+rps_rownames = rownames(MKP3[grep('^Rps', rownames(MKP3))])
+rpl_rownames = rownames(MKP3[grep('^Rpl', rownames(MKP3))])
+MKP3 <- MKP3[!(row.names(MKP3) %in% rps_rownames),]
+MKP3 <- MKP3[!(row.names(MKP3) %in% rpl_rownames),]
+MKP3[["percent.mt"]] <- PercentageFeatureSet(MKP3, pattern = "^mt-")
+
+## seurat object before filtering
+print("seurat object before filtering")
+print(VlnPlot(MKP3, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3))
+print(FeatureScatter(MKP3, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + geom_smooth(method = 'lm'))
+
+### filtering data
+MKP3 <- subset(MKP3, subset = nFeature_RNA > 250 & nFeature_RNA < 6000 & nCount_RNA > 400 & nCount_RNA < 20000)
+MKP3 <- subset(MKP3, subset = percent.mt < 5)
+
+## seurat object after filtering
+print("seurat object after filtering")
+print(VlnPlot(MKP3, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3))
+print(FeatureScatter(MKP3, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + geom_smooth(method = 'lm'))
+
+
+```
+
+### normalising data with the LogNormalize method, finding top 2000 variable features with the vst method, and scaling data based on all genes (not just the variable genes) while also regressing out the differences caused by various cell cycle states
+
+```{r cars2, echo=TRUE}
+
+# 3. Normalize data ----------
+MKP3 <- NormalizeData(MKP3, normalization.method = "LogNormalize", scale.factor = 10000)
+#str(MKP3)
+
+
+# 4. Identify highly variable features --------------
+MKP3 <- FindVariableFeatures(MKP3, selection.method = "vst", nfeatures = 2000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(MKP3), 10)
+
+# plot variable features with and without labels
+print("highly variable genes plot")
+plot1 <- VariableFeaturePlot(MKP3)
+LabelPoints(plot = plot1, points = top10, repel = TRUE)
+print(plot1)
+
+# 5. Scaling -------------
+s.genes <- str_to_title(cc.genes$s.genes)
+g2m.genes <- str_to_title(cc.genes$g2m.genes)
+all.genes <- rownames(MKP3)
+MKP3 <- CellCycleScoring(MKP3, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+MKP3 <- ScaleData(MKP3, vars.to.regress = c("percent.mt","S.Score", "G2M.Score"), features = all.genes)
+
+print("MKP3 seurat object after normalising, finding variable features, scaling, and regressing out cell cycle variable effects")
+MKP3 = RunPCA(MKP3, features = c(s.genes, g2m.genes))
+print(DimPlot(MKP3, reduction = "pca"))
+str(MKP3)
+
+
+```
+
+### HTO demultiplexing (Seurat HTODemux) to assign each cell to a condition: Platelet depletion(PD), Bl6, pDC+Platelet depletion (PDC+PD), and pDC depletion. Unfortunately, the hashtag pDC depletion did not work. We then removed cells that are doublets and negative hashtagged cells.
+```{r hto_demultiplex, echo=TRUE}
+# Add HTO data as a new assay independent from RNA
+obj.htos <- allABs.raw$MKP3[, colnames(MKP3)]
+MKP3[["HTO"]] <- CreateAssayObject(counts = obj.htos)
+
+# Normalize HTO data, here we use centered log-ratio (CLR) transformation
+MKP3 <- NormalizeData(MKP3, assay = "HTO", normalization.method = "CLR")
+MKP3 <- HTODemux(MKP3, assay = "HTO", positive.quantile = 0.99)
+
+
+print("HTO classification table")
+table(MKP3$HTO_classification.global)
+print("HTO hashtags")
+RidgePlot(MKP3, assay = "HTO", features = rownames(MKP3[["HTO"]])[1:4], ncol = 2)
+
+Idents(MKP3) <- "HTO_classification.global"
+MKP3HTO=MKP3[,MKP3$HTO_classification.global!="Doublet"]
+MKP3HTO=MKP3HTO[,MKP3HTO$HTO_classification.global!="Negative"]
+
+
+print("HTO classification table after removing doublets and negative hashtagged cells")
+table(MKP3HTO$HTO_classification)
+
+### adding the conditions as a vector to the seurat object
+cellList = colnames(MKP3HTO)
+featVec <- vector(mode="character", length=length(cellList))
+featVec = MKP3HTO$HTO_classification
+featVec[featVec == "pDC_depletion"] = "pDC_depletion"
+featVec[featVec == "pDC-Platelet_depletion"] = "pDC-Platelet_depletion"
+featVec[featVec == "Platelet_depletion"] = "Platelet_depletion"
+featVec[featVec == "Bl6"] = "Bl6"
+MKP3HTO$CSclassification=featVec
+
+# Calculate a tSNE embedding of the HTO data
+DefaultAssay(MKP3HTO) <- "HTO"
+MKP3HTO <- ScaleData(MKP3HTO, features = rownames(MKP3HTO),
+    verbose = FALSE)
+MKP3HTO <- RunPCA(MKP3HTO, features = rownames(MKP3HTO), approx = FALSE)
+MKP3HTO <- RunTSNE(MKP3HTO, dims = 1:8, perplexity = 100)
+print("HTO dimplot")
+print(DimPlot(MKP3HTO))
+
+
+
+```
+
+
+### PCA and UMAP are run on the seurat object based on the first 30 dimensions. The FindNeighbors function is also performed on the first 30 PCA dimensions. Finally, cells are clustered based on the resolution 0.25- which explained our clusters with true biological significance while separating based on differences. Finally, we found cluster specific genes with FindALlmarkers function based on the wilcoxson rank sum test with logfc threshold as greater than 0.25.The marker genes are then observed in a dotplot.
+```{r cluster_marker_genes, echo=TRUE}
+DefaultAssay(MKP3HTO) <- "RNA"
+# Select the top 2000 most variable features
+#MKP3HTO <- FindVariableFeatures(MKP3HTO, selection.method = "vst", nfeatures = 2000)
+
+# Scaling RNA data,
+MKP3HTO <- ScaleData(MKP3HTO, features = rownames(MKP3HTO))
+
+# Run PCA
+MKP3HTO <- RunPCA(MKP3HTO, features = VariableFeatures(MKP3HTO))
+MKP3HTO= RunUMAP(MKP3HTO, dims = 1:30, reduction.key = "UMAP_")
+MKP3HTO <- FindNeighbors(MKP3HTO, reduction = "pca", dims = 1:30)
+MKP3HTO <- FindClusters(MKP3HTO, resolution = 0.25, verbose = FALSE)
+
+
+# Projecting singlet identities on UMAP  visualization
+print(DimPlot(MKP3HTO, group.by = "HTO_classification"))
+print(DimPlot(MKP3HTO, shuffle = T, seed = 1, group.by= "HTO_classification", split.by= "HTO_classification", ncol=3, raster=FALSE))
+print(DimPlot(MKP3HTO, group.by= "seurat_clusters", raster=FALSE, label = TRUE))
+
+MKP3HTO_markers <- FindAllMarkers(MKP3HTO, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, test.use = "wilcox")
+MKP3HTO_markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 2, order_by = avg_log2FC)
+
+# plotting the marker genes
+MKP3HTO_markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+print("Dotplot of cluster defining genes")
+
+print(DotPlot(MKP3HTO, features = unique(top10$gene))+ RotatedAxis())
+```
+
+# gene set enrichment analysis using the enrichR package for the top 50 marker genes of each cluster to better  understand the composition of each cluster.
+```{r cluster_enrichment, echo=TRUE}
+
+Idents(MKP3HTO) = MKP3HTO$seurat_clusters
+new.cluster.ids <- c("Mixed_progenitors","Late_MKP","MK-MEP","MK-MEP_cycling","GMP","Early_MKP","Immature_neutrophils","Basophils","NK","Erythroid")
+names(new.cluster.ids) <- levels(MKP3HTO)
+MKP3HTO <- RenameIdents(MKP3HTO, new.cluster.ids)
+MKP3HTO$Idents = Idents(MKP3HTO)
+
+MKP3HTO_markers <- FindAllMarkers(MKP3HTO, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, test.use = "wilcox")
+MKP3HTO_markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 2, order_by = avg_log2FC)
+
+MKP3HTO_markers %>%
+    group_by(cluster) %>%
+    top_n(n = 50, wt = avg_log2FC) -> top50
+
+top50 = as.data.frame(top50)
+conditions <- c("Mixed_progenitors","Late_MKP","MK-MEP","MK-MEP_cycling","GMP","Early_MKP","Immature_neutrophils","Basophils","NK","Erythroid")
+for (ident in conditions){
+enrich_genes = top50[top50$cluster == ident, ]$gene
+    enrichment_results <- enrichR::enrichr(
+      genes = enrich_genes,
+      databases = "GO_Biological_Process_2023"
+    )
+    enrichment_results = as.data.frame(enrichment_results)
+    enrichment_data <- data.frame(
+  Term = enrichment_results$GO_Biological_Process_2023.Term,
+  Overlap = enrichment_results$GO_Biological_Process_2023.Overlap,
+  P.value = enrichment_results$GO_Biological_Process_2023.P.value,
+  Adjusted.P.value = enrichment_results$GO_Biological_Process_2023.Adjusted.P.value,
+  Odds.Ratio = enrichment_results$GO_Biological_Process_2023.Odds.Ratio,
+  Combined.Score = enrichment_results$GO_Biological_Process_2023.Combined.Score,
+  Genes = enrichment_results$GO_Biological_Process_2023.Genes
+)
+       enrich = plotEnrich(enrichment_data)
+       print(ident)
+       print(enrich)
+}
+```
+
+### getting proportion of cells per cluster belonging to each of the 4 conditions using the dittoBarPlot package.
+```{r proportion, echo=TRUE}
+print("getting proportion of cells per cluster for each condition")
+#BiocManager::install("dittoSeq")
+
+
+dittoBarPlot(
+    object = MKP3HTO,
+    var = "CSclassification",
+    group.by = "RNA_snn_res.0.2")
+```
+
+## reading in the top 40 response to type I interferon genes from the bulk-seq reactome pathway analysis 
+```{r interferon, echo=TRUE}
+DefaultAssay(MKP3HTO) <- "RNA"
+## response to type I interferon genes as bulk_seq genes
+bulk_seq = read.csv("./data/GOBP_RESPONSE_TO_TYPE_I_INTERFERON.csv", header = TRUE)
+print("response to interferon genes")
+head(bulk_seq)
+
+## seurat object
+MKP3HTO = readRDS("~/Downloads/final_MKP3HTO.RDS")
+
+## getting the top 40 genes from response to type I interferon genes
+bulk_seq = as.data.frame(bulk_seq)
+rownames(bulk_seq) = bulk_seq$PROBE
+bulk_seq_genes = head(rownames(bulk_seq), 40)
+## converting the genes to mouse gene form - "Tyk2" "Hla-a"
+bulk_seq_genes = tolower(bulk_seq_genes)
+firstup = function(x) {
+  substr(x, 1, 1) = toupper(substr(x, 1, 1))
+  
+  x
+}
+bulk_seq_genes = firstup(bulk_seq_genes)
+print("response to interferon genes after processing")
+bulk_seq_genes
+### renaming the idents of seurat obj to conditions instead of clusters to calculate fold change between conditions for the genes
+Idents(MKP3HTO) = MKP3HTO$CSclassification
+
+
+```
+
+## projecting the response to type I interferon genes onto the single cell data using AddModuleScore function
+```{r projecting_interferon_genes, echo=TRUE}
+
+print("projecting the response to type I interferon genes onto the single cell data")
+
+MKP3HTO <- AddModuleScore(MKP3HTO,
+                    features = list(bulk_seq_genes), name = "bulk_seq_genes")
+
+print(VlnPlot(MKP3HTO, features = "bulk_seq_genes1", group.by ="CSclassification"))
+
+print(VlnPlot(MKP3HTO, features = "bulk_seq_genes1", split.by ="CSclassification"))
+
+print(VlnPlot(MKP3HTO, features = "bulk_seq_genes1", group.by ="CSclassification", split.by = "RNA_snn_res.0.2"))
+
+print(VlnPlot(MKP3HTO, features = "bulk_seq_genes1", split.by ="CSclassification", group.by = "RNA_snn_res.0.2"))
+
+print(VlnPlot(MKP3HTO, features = "bulk_seq_genes1", group.by = "RNA_snn_res.0.2"))
+```
+
+### identifying the DE genes from bulk-seq data by determining the cutoff as log FC > 0.25 and FDR < 0.05 per comparison. We then projected these bulk seq DE genes onto the single cell data for each comparison using the Module Score Function.
+```{r bulk_seq_de_genes, echo=TRUE}
+print("calculating DE genes from bulk_seq data as log FC > 0.25 and FDR < 0.05")
+bulk_de_genes = read.csv("./data/MKP_samples_log2FC_forVisha.csv", header = TRUE)
+rownames(bulk_de_genes) = bulk_de_genes$Gene_name
+# Create a subset of the data frame
+genes_pdpdc_vs_cntrl  <- subset(bulk_de_genes, abs(log2FC_PD_DT_vs_Ctrl) > 0.25 & (FDR_PD_DT_vs_control) < 0.05)
+genes_pdpdc_vs_cntrl = rownames(genes_pdpdc_vs_cntrl)
+
+genes_pd_vs_pdpdc  <- subset(bulk_de_genes, abs(log2FC_PD_vs_PD_DT) > 0.25 & (FDR_PD_vs_PD_DT) < 0.05)
+genes_pd_vs_pdpdc = rownames(genes_pd_vs_pdpdc)
+
+genes_pd_vs_cntrl  <- subset(bulk_de_genes, abs(log2FC_PD_vs_Ctrl) > 0.25 & (FDR_PD_vs_control) < 0.05)
+genes_pd_vs_cntrl = rownames(genes_pd_vs_cntrl)
+
+print("projecting the bulk rna DE genes (platelet depletion vs Bl6) onto the single cell data")
+
+genes_pd_vs_cntrl_pos  <- subset(bulk_de_genes, (log2FC_PD_vs_Ctrl) > 0.25 & (FDR_PD_vs_control) < 0.05)
+
+MKP3HTO <- AddModuleScore(MKP3HTO,
+                    features = list(genes_pd_vs_cntrl_pos), name = "genes_pd_vs_cntrl_pos")
+
+print(VlnPlot(MKP3HTO, features = "genes_pd_vs_cntrl_pos1", group.by ="CSclassification"))
+print(VlnPlot(MKP3HTO, features = "genes_pd_vs_cntrl_pos1", split.by ="CSclassification"))
+print(VlnPlot(MKP3HTO, features = "genes_pd_vs_cntrl_pos1", group.by ="CSclassification", split.by = "Idents"))
+print(VlnPlot(MKP3HTO, features = "genes_pd_vs_cntrl_pos1", group.by = "Idents"))
+
+```
+
+# projecting the common genes between bulk sequencing DE genes upregulated for PD vs CNTRL and downregulated for PDC+PD VS CNTRL onto the single-cell clusters using the AddModuleScore function and visualised the results using violin plots
+```{r cell_cycle, echo=TRUE}
+genes_pd_vs_cntrl  <- subset(bulk_de_genes, log2FC_PD_vs_Ctrl > 0)
+genes_pd_vs_cntrl = rownames(genes_pd_vs_cntrl)
+genes_pdpdc_vs_pd = subset(bulk_de_genes, log2FC_PD_DT_vs_PD < 0)
+genes_pdpdc_vs_pd = rownames(genes_pdpdc_vs_pd)
+
+final_genes = intersect(genes_pd_vs_cntrl, genes_pdpdc_vs_pd)
+
+MKP3HTO <- AddModuleScore(MKP3HTO,
+                    features = list(final_genes), name = "final_genes")
+MKP3HTO = subset(x = MKP3HTO, subset = CSclassification=="pDC-depletion", invert = TRUE)
+Idents(MKP3HTO) = MKP3HTO$Idents
+print(VlnPlot(MKP3HTO, features = "final_genes1", group.by ="CSclassification"))
+print(VlnPlot(MKP3HTO, features = "final_genes1", split.by ="CSclassification"))
+print(VlnPlot(MKP3HTO, features = "final_genes1", group.by ="CSclassification", split.by = "Idents"))
+print(VlnPlot(MKP3HTO, features = "final_genes1", group.by = "Idents"))
+
+p = VlnPlot(MKP3HTO, features = "final_genes1", group.by = "Idents")
+ggsave("~/Downloads/final_genesnew.svg", plot = p, width = 18, height = 10, limitsize = FALSE)
+```
+
+## This block of code finds the differentially expressed genes for each cluster between the three conditions (Bl6 vs PD, PD vs pDC-PD, and Bl6 vs pDC-PD) using the wilcox test for all the genes of the seurat object. The DE genes are selected based on the threshold of avg_log2FC > 0.25 and p_val_adj < 0.05. The DE genes are then plotted onto a volcano plot using the package EnhancedVolcano. Finally, the DE genes are run through enrichR for a gene set enrichment analysis.The genes are filtered to a positive set if their log fc > 0 and a negative set if their log fc < 0 for separating the input to the enrichment analysis.
+```{r de_results, echo=TRUE}
+
+# Define the conditions and cluster names
+conditions <- c("Bl6", "Platelet-depletion", "pDC-Platelet-depletion")
+cluster_names <- c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
+
+# Perform differential expression and enrichment analysis for each cluster
+
+for (cluster_name in cluster_names) {
+  cat("Cluster:", cluster_name, "\n")
+  
+  # Define a list of comparisons for each cluster
+  comparisons <- list(
+    "Bl6_vs_Platelet-depletion" = c("Bl6", "Platelet-depletion"),
+    "Platelet-depletion_vs_pDC-Platelet-depletion" = c("Platelet-depletion", "pDC-Platelet-depletion"),
+    "Bl6_vs_pDC-Platelet-depletion" = c("Bl6", "pDC-Platelet-depletion")
+  )
+  subset_obj = subset(x = MKP3HTO, subset = seurat_clusters == cluster_name)
+  for (comparison_name in names(comparisons)) {
+    conditions_to_compare <- comparisons[[comparison_name]]
+    
+    # Extract gene names
+    gene_names <- rownames(subset_obj@assays$RNA@scale.data)[subset_obj$seurat_clusters == cluster_name]
+    
+    # Perform differential expression analysis
+    de_results <- FindMarkers(
+      subset_obj,
+      ident.1 = conditions_to_compare[1],
+      ident.2 = conditions_to_compare[2],
+      test.use = "wilcox",
+      genes.use = gene_names  # Specify the gene names for the comparison
+    )
+    
+    
+    # Get the list of differentially expressed genes
+    #de_genes <- de_results[abs(de_results$avg_log2FC) > 0.25 & de_results$p_val_adj < 0.05, ]
+    # Define the file name
+    file_name <- paste("cluster", cluster_name, comparison_name, ".csv", sep = "_")
+    de_genes$genes = rownames(de_genes)
+    # Write the results to a CSV file
+    write.csv(de_genes, file = file_name, row.names = TRUE)
+    
+    cat("Saved results to file:", file_name, "\n")
+    
+    enrich_genes_neg = rownames(de_genes[de_genes$avg_log2FC < 0, ])
+    enrich_genes_pos = rownames(de_genes[de_genes$avg_log2FC > 0, ])
+    
+    enrichment_results_neg <- enrichR::enrichr(
+      genes = enrich_genes_neg,
+      databases = "GO_Biological_Process_2023"
+    )
+    enrichment_results_neg = as.data.frame(enrichment_results_neg)
+    enrichment_data_neg <- data.frame(
+  Term = enrichment_results_neg$GO_Biological_Process_2023.Term,
+  Overlap = enrichment_results_neg$GO_Biological_Process_2023.Overlap,
+  P.value = enrichment_results_neg$GO_Biological_Process_2023.P.value,
+  Adjusted.P.value = enrichment_results_neg$GO_Biological_Process_2023.Adjusted.P.value,
+  Odds.Ratio = enrichment_results_neg$GO_Biological_Process_2023.Odds.Ratio,
+  Combined.Score = enrichment_results_neg$GO_Biological_Process_2023.Combined.Score,
+  Genes = enrichment_results_neg$GO_Biological_Process_2023.Genes
+)
+    if (nrow(enrichment_data_neg) == 0) {
+          next
+    }else{
+       enrich_neg = plotEnrich(enrichment_data_neg)
+      ggsave(paste("cluster", cluster_name, comparison_name, "neg.png", sep = "_"), plot = enrich_neg)
+}
+    
+    enrichment_results_pos <- enrichR::enrichr(
+      genes = enrich_genes_pos,
+      databases = "GO_Biological_Process_2023"
+    )
+    enrichment_results_pos = as.data.frame(enrichment_results_pos)
+        enrichment_data_pos <- data.frame(
+  Term = enrichment_results_pos$GO_Biological_Process_2023.Term,
+  Overlap = enrichment_results_pos$GO_Biological_Process_2023.Overlap,
+  P.value = enrichment_results_pos$GO_Biological_Process_2023.P.value,
+  Adjusted.P.value = enrichment_results_pos$GO_Biological_Process_2023.Adjusted.P.value,
+  Odds.Ratio = enrichment_results_pos$GO_Biological_Process_2023.Odds.Ratio,
+  Combined.Score = enrichment_results_pos$GO_Biological_Process_2023.Combined.Score,
+  Genes = enrichment_results_pos$GO_Biological_Process_2023.Genes
+)
+# Plot the enrichment results
+        if (nrow(enrichment_data_pos) == 0) {
+          next
+        }else{
+          enrich_pos = plotEnrich(enrichment_data_pos)
+          ggsave(paste("cluster", cluster_name, comparison_name, "pos.png", sep = "_"), plot = enrich_pos)
+  }
+}
+}
+```
+
+
+# This block of code comapres the DE genes of each cluster between conditions to the bulk_seq DE genes between conditions and finds the common DE genes between single-cell data and bulk-seq data. The common genes' expression levels on signle-cell data are then plot using a violin plot and enriched using enrichR (same as above).
+```{r volcano, echo=TRUE}
+#BiocManager::install('EnhancedVolcano')
+#install.packages("sjmisc")
+#library(sjmisc)
+Idents(MKP3HTO) = MKP3HTO$CSclassification
+
+conditions <- c("Bl6", "Platelet-depletion", "pDC-Platelet-depletion")
+cluster_names <- c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
+
+# Perform differential expression and enrichment analysis for each cluster
+for (cluster_name in cluster_names) {
+  cat("Cluster:", cluster_name, "\n")
+  
+  # Define a list of comparisons for each cluster
+  comparisons <- list(
+    "Platelet-depletion_vs_Bl6" = c("Platelet-depletion", "Bl6"),
+    "Platelet-depletion_vs_pDC-Platelet-depletion" = c("Platelet-depletion", "pDC-Platelet-depletion"),
+    "pDC-Platelet-depletion_vs_Bl6" = c("pDC-Platelet-depletion", "Bl6")
+  )
+  subset_obj = subset(x = MKP3HTO, subset = seurat_clusters == cluster_name)
+  for (comparison_name in names(comparisons)) {
+    conditions_to_compare <- comparisons[[comparison_name]]
+    print(conditions_to_compare)
+    # Extract gene names
+    gene_names <- rownames(subset_obj@assays$RNA@scale.data)[subset_obj$seurat_clusters == cluster_name]
+    # Perform differential expression analysis
+    de_results <- FindMarkers(
+      subset_obj,
+      ident.1 = conditions_to_compare[1],
+      ident.2 = conditions_to_compare[2],
+      test.use = "wilcox",
+      genes.use = gene_names  # Specify the gene names for the comparison
+    )
+    volcano = EnhancedVolcano(de_results,
+    lab = rownames(de_results),
+    x = 'avg_log2FC',
+    y = 'p_val_adj',
+    title = paste("cluster", cluster_name, comparison_name, sep = "_"),
+    pCutoff = 0.05,
+    FCcutoff = 0.25,
+    pointSize = 3.0,
+    colAlpha = 1,
+    legendLabSize = 12,
+    legendIconSize = 4.0,
+    drawConnectors = TRUE,
+    widthConnectors = 0.2,
+    max.overlaps = 300,
+    colConnectors = 'grey30',
+    labSize = 6.0)
+    ggsave(paste("cluster", cluster_name, comparison_name, ".png", sep = "_"), plot = volcano)
+    print(volcano)
+    de_genes <- de_results[abs(de_results$avg_log2FC) > 0.25 & de_results$p_val_adj < 0.05, ]
+    de_genes$genes = rownames(de_genes)
+    de_genes_neg = rownames(de_genes[de_genes$avg_log2FC < 0, ])
+    de_genes_pos = rownames(de_genes[de_genes$avg_log2FC > 0, ])
+    if (is_empty(de_genes_neg) & is_empty(de_genes_pos)){
+      next
+    }
+    else if (is_empty(de_genes_neg) & !is_empty(de_genes_pos)){
+      file_name_pos <- paste("cluster", cluster_name, comparison_name, "pos.csv", sep = "_")
+      write.csv(de_genes_pos, file = file_name_pos, row.names = TRUE)
+      if (comparisons[[comparison_name]][1] == "Platelet-depletion" & comparisons[[comparison_name]][2] =="Bl6")
+      {
+        common_genes_pos = intersect(genes_pd_vs_cntrl_pos[[1]], de_genes_pos)
+      }
+      else if (comparisons[[comparison_name]][1] == "Platelet-depletion" & comparisons[[comparison_name]][2] =="pDC-Platelet-depletion")
+      {
+        common_genes_pos = intersect(genes_pd_vs_pdpdc_pos[[1]], de_genes_pos)
+      }
+      else {
+          common_genes_pos = intersect(genes_pdpdc_vs_cntrl_pos[[1]], de_genes_pos)
+      }
+          
+          common_genes_neg = character()
+          if (is_empty(common_genes_pos) & is_empty(common_genes_neg)){
+          next
+          }
+          else{
+              file_name_pos_common_genes <- paste("cluster", cluster_name, comparison_name, "common_genes_pos.csv", sep = "_")
+             write.csv(common_genes_pos, file = file_name_pos_common_genes, row.names = TRUE)
+              pos_vlnplt = VlnPlot(subset_obj, features = common_genes_pos)
+            ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_pos_vlnplt.png", sep = "_"), plot = pos_vlnplt)
+            
+                enrichment_results_pos <- enrichR::enrichr(
+              genes = common_genes_pos,
+              databases = "GO_Biological_Process_2023"
+            )
+            enrichment_results_pos = as.data.frame(enrichment_results_pos)
+                enrichment_data_pos <- data.frame(
+          Term = enrichment_results_pos$GO_Biological_Process_2023.Term,
+          Overlap = enrichment_results_pos$GO_Biological_Process_2023.Overlap,
+          P.value = enrichment_results_pos$GO_Biological_Process_2023.P.value,
+          Adjusted.P.value = enrichment_results_pos$GO_Biological_Process_2023.Adjusted.P.value,
+          Odds.Ratio = enrichment_results_pos$GO_Biological_Process_2023.Odds.Ratio,
+          Combined.Score = enrichment_results_pos$GO_Biological_Process_2023.Combined.Score,
+          Genes = enrichment_results_pos$GO_Biological_Process_2023.Genes
+        )
+        # Plot the enrichment results
+                if (nrow(enrichment_data_pos) == 0) {
+                  next
+                }else{
+                  enrich_pos = plotEnrich(enrichment_data_pos)
+                  ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_pos.png", sep = "_"), plot = enrich_pos)
+          }
+              }
+    }      
+    else if (!is_empty(de_genes_neg) & is_empty(de_genes_pos)){
+      file_name_neg <- paste("cluster", cluster_name, comparison_name, "neg.csv", sep = "_")
+      write.csv(de_genes_neg, file = file_name_neg, row.names = TRUE)
+      if (comparisons[[comparison_name]][1] == "Platelet-depletion" & comparisons[[comparison_name]][2] =="Bl6")
+      {
+        common_genes_neg = intersect(genes_pd_vs_cntrl_neg[[1]], de_genes_neg)
+      }
+      else if (comparisons[[comparison_name]][1] == "Platelet-depletion" & comparisons[[comparison_name]][2] =="pDC-Platelet-depletion")
+      {
+        common_genes_neg = intersect(genes_pd_vs_pdpdc_neg[[1]], de_genes_neg)
+      }
+      else {
+          common_genes_neg = intersect(genes_pdpdc_vs_cntrl_neg[[1]], de_genes_neg)
+      }
+          
+          common_genes_pos = character()
+          if (is_empty(common_genes_pos) & is_empty(common_genes_neg)){
+          next
+          }
+          else{
+              file_name_neg_common_genes <- paste("cluster", cluster_name, comparison_name, "common_genes_neg.csv", sep = "_")
+             write.csv(common_genes_neg, file = file_name_neg_common_genes, row.names = TRUE)
+              neg_vlnplt = VlnPlot(subset_obj, features = common_genes_neg)
+            ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_neg_vlnplt.png", sep = "_"), plot = neg_vlnplt)
+            
+                enrichment_results_neg <- enrichR::enrichr(
+              genes = common_genes_neg,
+              databases = "GO_Biological_Process_2023"
+            )
+            enrichment_results_neg = as.data.frame(enrichment_results_neg)
+                enrichment_data_neg <- data.frame(
+          Term = enrichment_results_neg$GO_Biological_Process_2023.Term,
+          Overlap = enrichment_results_neg$GO_Biological_Process_2023.Overlap,
+          P.value = enrichment_results_neg$GO_Biological_Process_2023.P.value,
+          Adjusted.P.value = enrichment_results_neg$GO_Biological_Process_2023.Adjusted.P.value,
+          Odds.Ratio = enrichment_results_neg$GO_Biological_Process_2023.Odds.Ratio,
+          Combined.Score = enrichment_results_neg$GO_Biological_Process_2023.Combined.Score,
+          Genes = enrichment_results_neg$GO_Biological_Process_2023.Genes
+        )
+        # Plot the enrichment results
+                if (nrow(enrichment_data_neg) == 0) {
+                  next
+                }else{
+                  enrich_neg = plotEnrich(enrichment_data_neg)
+                  ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_neg.png", sep = "_"), plot = enrich_neg)
+          }
+          }
+    }
+    else{
+    # Define the file name
+    file_name_pos <- paste("cluster", cluster_name, comparison_name, "pos.csv", sep = "_")
+    file_name_neg <- paste("cluster", cluster_name, comparison_name, "neg.csv", sep = "_")
+    # Write the results to a CSV file
+    write.csv(de_genes_pos, file = file_name_pos, row.names = TRUE)
+    write.csv(de_genes_neg, file = file_name_neg, row.names = TRUE)
+    
+    if (comparisons[[comparison_name]][1] == "Platelet-depletion" & comparisons[[comparison_name]][2] =="Bl6")
+    {
+      common_genes_pos = intersect(genes_pd_vs_cntrl_pos[[1]], de_genes_pos)
+      common_genes_neg = intersect(genes_pd_vs_cntrl_neg[[1]], de_genes_neg)
+    }
+    else if (comparisons[[comparison_name]][1] == "Platelet-depletion" & comparisons[[comparison_name]][2] =="pDC-Platelet-depletion")
+    {
+      common_genes_pos = intersect(genes_pd_vs_pdpdc_pos[[1]], de_genes_pos)
+      common_genes_neg = intersect(genes_pd_vs_pdpdc_neg[[1]], de_genes_neg)
+    }
+    else {
+      common_genes_pos = intersect(genes_pdpdc_vs_cntrl_pos[[1]], de_genes_pos)
+      common_genes_neg = intersect(genes_pdpdc_vs_cntrl_neg[[1]], de_genes_neg)
+    }
+    
+    
+    if (is_empty(common_genes_pos) & is_empty(common_genes_neg)){
+      next
+    }
+    else if (is_empty(common_genes_pos) & !is_empty(common_genes_neg)){
+      file_name_neg_common_genes <- paste("cluster", cluster_name, comparison_name, "common_genes_neg.csv", sep = "_")
+      write.csv(common_genes_neg, file = file_name_neg_common_genes, row.names = TRUE)
+      neg_vlnplt = VlnPlot(subset_obj, features = common_genes_neg)
+    ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_neg_vlnplt.png", sep = "_"), plot = neg_vlnplt)
+    
+    enrichment_results_neg <- enrichR::enrichr(
+      genes = common_genes_neg,
+      databases = "GO_Biological_Process_2023"
+    )
+    enrichment_results_neg = as.data.frame(enrichment_results_neg)
+    enrichment_data_neg <- data.frame(
+  Term = enrichment_results_neg$GO_Biological_Process_2023.Term,
+  Overlap = enrichment_results_neg$GO_Biological_Process_2023.Overlap,
+  P.value = enrichment_results_neg$GO_Biological_Process_2023.P.value,
+  Adjusted.P.value = enrichment_results_neg$GO_Biological_Process_2023.Adjusted.P.value,
+  Odds.Ratio = enrichment_results_neg$GO_Biological_Process_2023.Odds.Ratio,
+  Combined.Score = enrichment_results_neg$GO_Biological_Process_2023.Combined.Score,
+  Genes = enrichment_results_neg$GO_Biological_Process_2023.Genes
+)
+    if (nrow(enrichment_data_neg) == 0) {
+          next
+    }else{
+       enrich_neg = plotEnrich(enrichment_data_neg)
+      ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_neg.png", sep = "_"), plot = enrich_neg)
+}
+    }
+    else if (!is_empty(common_genes_pos) & is_empty(common_genes_neg)){
+      file_name_pos_common_genes <- paste("cluster", cluster_name, comparison_name, "common_genes_pos.csv", sep = "_")
+     write.csv(common_genes_pos, file = file_name_pos_common_genes, row.names = TRUE)
+      pos_vlnplt = VlnPlot(subset_obj, features = common_genes_pos)
+    ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_pos_vlnplt.png", sep = "_"), plot = pos_vlnplt)
+    
+        enrichment_results_pos <- enrichR::enrichr(
+      genes = common_genes_pos,
+      databases = "GO_Biological_Process_2023"
+    )
+    enrichment_results_pos = as.data.frame(enrichment_results_pos)
+        enrichment_data_pos <- data.frame(
+  Term = enrichment_results_pos$GO_Biological_Process_2023.Term,
+  Overlap = enrichment_results_pos$GO_Biological_Process_2023.Overlap,
+  P.value = enrichment_results_pos$GO_Biological_Process_2023.P.value,
+  Adjusted.P.value = enrichment_results_pos$GO_Biological_Process_2023.Adjusted.P.value,
+  Odds.Ratio = enrichment_results_pos$GO_Biological_Process_2023.Odds.Ratio,
+  Combined.Score = enrichment_results_pos$GO_Biological_Process_2023.Combined.Score,
+  Genes = enrichment_results_pos$GO_Biological_Process_2023.Genes
+)
+# Plot the enrichment results
+        if (nrow(enrichment_data_pos) == 0) {
+          next
+        }else{
+          enrich_pos = plotEnrich(enrichment_data_pos)
+          ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_pos.png", sep = "_"), plot = enrich_pos)
+  }
+    }
+    else{
+      file_name_pos_common_genes <- paste("cluster", cluster_name, comparison_name, "common_genes_pos.csv", sep = "_")
+    file_name_neg_common_genes <- paste("cluster", cluster_name, comparison_name, "common_genes_neg.csv", sep = "_")
+    write.csv(common_genes_pos, file = file_name_pos_common_genes, row.names = TRUE)
+    write.csv(common_genes_neg, file = file_name_neg_common_genes, row.names = TRUE)
+    
+    pos_vlnplt = VlnPlot(subset_obj, features = common_genes_pos)
+    ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_pos_vlnplt.png", sep = "_"), plot = pos_vlnplt)
+    neg_vlnplt = VlnPlot(subset_obj, features = common_genes_neg)
+    ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_neg_vlnplt.png", sep = "_"), plot = neg_vlnplt)
+    
+    enrichment_results_neg <- enrichR::enrichr(
+      genes = common_genes_neg,
+      databases = "GO_Biological_Process_2023"
+    )
+    enrichment_results_neg = as.data.frame(enrichment_results_neg)
+    enrichment_data_neg <- data.frame(
+  Term = enrichment_results_neg$GO_Biological_Process_2023.Term,
+  Overlap = enrichment_results_neg$GO_Biological_Process_2023.Overlap,
+  P.value = enrichment_results_neg$GO_Biological_Process_2023.P.value,
+  Adjusted.P.value = enrichment_results_neg$GO_Biological_Process_2023.Adjusted.P.value,
+  Odds.Ratio = enrichment_results_neg$GO_Biological_Process_2023.Odds.Ratio,
+  Combined.Score = enrichment_results_neg$GO_Biological_Process_2023.Combined.Score,
+  Genes = enrichment_results_neg$GO_Biological_Process_2023.Genes
+)
+    if (nrow(enrichment_data_neg) == 0) {
+          next
+    }else{
+       enrich_neg = plotEnrich(enrichment_data_neg)
+      ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_neg.png", sep = "_"), plot = enrich_neg)
+    }
+    
+        enrichment_results_pos <- enrichR::enrichr(
+      genes = common_genes_pos,
+      databases = "GO_Biological_Process_2023"
+    )
+    enrichment_results_pos = as.data.frame(enrichment_results_pos)
+        enrichment_data_pos <- data.frame(
+  Term = enrichment_results_pos$GO_Biological_Process_2023.Term,
+  Overlap = enrichment_results_pos$GO_Biological_Process_2023.Overlap,
+  P.value = enrichment_results_pos$GO_Biological_Process_2023.P.value,
+  Adjusted.P.value = enrichment_results_pos$GO_Biological_Process_2023.Adjusted.P.value,
+  Odds.Ratio = enrichment_results_pos$GO_Biological_Process_2023.Odds.Ratio,
+  Combined.Score = enrichment_results_pos$GO_Biological_Process_2023.Combined.Score,
+  Genes = enrichment_results_pos$GO_Biological_Process_2023.Genes
+)
+# Plot the enrichment results
+        if (nrow(enrichment_data_pos) == 0) {
+          next
+        }else{
+          enrich_pos = plotEnrich(enrichment_data_pos)
+          ggsave(paste("cluster", cluster_name, comparison_name, "common_genes_pos.png", sep = "_"), plot = enrich_pos)
+  }
+    }
+    }
+}
+}
+
+```
+
+# scatterplots to plot the common DE genes between single-cell clusters (MK-MEP cycling and MK-MEP) and bulk-seq for the comparison PD vs CNTRL. the axis' represent the expression levels of the genes in the experiments.
+```{r scatter_plots, echo=TRUE}
+
+
+cluster_3_Platelet_depletion_vs_Bl6_common_genes_pos = read.csv("~/Downloads/cluster_3_Platelet-depletion_vs_Bl6_common_genes_pos.csv")
+cluster_3_Platelet_depletion_vs_Bl6_common_genes_pos = cluster_3_Platelet_depletion_vs_Bl6_common_genes_pos$x
+
+
+subset_obj = subset(x = MKP3HTO, subset = seurat_clusters == 3)
+Idents(subset_obj) = subset_obj$CSclassification
+de_results <- FindMarkers(
+      subset_obj,
+      ident.1 = "Platelet-depletion",
+      ident.2 = "Bl6",
+      test.use = "wilcox",
+      genes.use = rownames(subset_obj)  # Specify the gene names for the comparison
+    )
+
+y = de_results[interferon, ]
+na.omit(y)
+de_results = de_results[cluster_3_Platelet_depletion_vs_Bl6_common_genes_pos, ]    
+genes_pd_vs_cntrl_pos  <- subset(bulk_de_genes, log2FC_PD_vs_Ctrl > 0.25 & (FDR_PD_vs_control) < 0.05)
+genes_pd_vs_cntrl_pos = genes_pd_vs_cntrl_pos[, c("log2FC_PD_vs_Ctrl", "FDR_PD_vs_control")]
+genes_pd_vs_cntrl_pos = genes_pd_vs_cntrl_pos[cluster_3_Platelet_depletion_vs_Bl6_common_genes_pos, ]
+VlnPlot(subset_obj, features = cluster_3_Platelet_depletion_vs_Bl6_common_genes_pos)
+
+genes_pd_vs_cntrl_pos$Gene = rownames(genes_pd_vs_cntrl_pos)
+de_results$Gene = rownames(de_results)
+
+merged_data <- merge(de_results, genes_pd_vs_cntrl_pos, by = "Gene", all = TRUE)
+rownames(merged_data) = merged_data$Gene
+# Create the scatterplot
+p = ggplot(data = merged_data, aes(x = avg_log2FC, y = log2FC_PD_vs_Ctrl, label = Gene,color = avg_log2FC)) +
+  geom_point() +
+  geom_text(hjust = 0.001, vjust = 0.001, nudge_x = 0.001, nudge_y = 0.001, size = 3) + # Adjust label position and size
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(x = "Single Cell Cluster MK-MEP_cycling", y = "Bulk Seq PD vs Bl6") +
+  ggtitle("Scatterplot of Fold Changes for common PD vs Bl6 DE genes")
+ggsave("scatter_plot1.svg", plot = p, width = 15, height = 8, limitsize = FALSE)
+
+## response to type I interferon genes as bulk_seq genes
+interferon = read.csv("~/Downloads/GOBP_RESPONSE_TO_TYPE_I_INTERFERON.csv", header = TRUE)
+
+
+## converting the genes to mouse gene form - "Tyk2" "Hla-a"
+interferon$PROBE = tolower(interferon$PROBE)
+firstup = function(x) {
+  substr(x, 1, 1) = toupper(substr(x, 1, 1))
+  
+  x
+}
+interferon$PROBE = firstup(interferon$PROBE)
+rownames(interferon) = interferon$PROBE
+interferon = head(rownames(interferon), 40)
+
+genes_pd_vs_cntrl_pos  <- bulk_de_genes
+genes_pd_vs_cntrl_pos = genes_pd_vs_cntrl_pos[, c("log2FC_PD_vs_Ctrl", "FDR_PD_vs_control")]
+genes_pd_vs_cntrl_pos = genes_pd_vs_cntrl_pos[interferon, ]
+genes_pd_vs_cntrl_pos = na.omit(genes_pd_vs_cntrl_pos)
+inf_final = rownames(genes_pd_vs_cntrl_pos)
+genes_pd_vs_cntrl_pos$Gene = rownames(genes_pd_vs_cntrl_pos)
+
+
+# Perform differential expression analysis using the binary variable
+subset_obj = subset(x = MKP3HTO, subset = seurat_clusters == 3)
+Idents(subset_obj) = subset_obj$CSclassification
+de_results_inf <- FindMarkers(subset_obj, ident.1 = "Platelet-depletion", ident.2 = "Bl6", test.use = "DESeq2")
+de_results_inf = de_results_inf[inf_final, ]
+de_results_inf = na.omit(de_results_inf)
+de_results_inf$Gene = rownames(de_results_inf)
+
+
+merged_data <- merge(de_results_inf, genes_pd_vs_cntrl_pos, by = "Gene", all = TRUE)
+rownames(merged_data) = merged_data$Gene
+# Create the scatterplot
+p = ggplot(data = merged_data, aes(x = avg_log2FC, y = log2FC_PD_vs_Ctrl, label = Gene,color = avg_log2FC)) +
+  geom_point() +
+  geom_text(hjust = 0.001, vjust = 0.001, nudge_x = 0.001, nudge_y = 0.001, size = 3) + # Adjust label position and size
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(x = "Single Cell Cluster MK-MEP_cycling", y = "Bulk Seq PD vs Bl6") +
+  ggtitle("Scatterplot of Fold Changes for interferon response genes PD vs Bl6")
+ggsave("scatter_plot3.svg", plot = p, width = 20, height = 8, limitsize = FALSE)
+
+
+
+```
+
+# dotplot of genes per category to determine the clusters more accurately
+```{r dotplot, echo=TRUE}
+
+# Load the required Seurat library
+
+
+# Load your Seurat object (replace 'seurat_obj' with your Seurat object)
+seurat_obj <- MKP3HTO
+
+# Define the gene sets as a list of lists
+    MK_TF = c("Cited2", "Fli1", "Pbx1", "Mef2c", "Meis1")
+    MK_GRANULES = c("Pf4", "Vwf", "Clu", "Ppbp", "Serpine2", "Thbs1", "F5", "Ctla2a", "Angpt1")
+    MK_SIGNALING = c("Rap1b", "Cavin2", "Tpm4", "Myl9", "Gng11", "Alox12", "Tmsb4x", "Plek", "Prkg1", "Prkca", "Trpc6")
+    MK_SURFACE = c("Itga2b", "Mpl", "Cd9", "Gp9", "Gp1bb", "Gp5", "Gp6", "Clec1b", "Slamf1")
+    ERY_TF = c("Zfpm1", "Hmbg3", "Gata1", "Gfi1b", "Klf1")
+    ERY = c("Eng", "Car2", "Hba-a2", "Gypa")
+    GMP_TF = c("Gata2", "Cebpa", "Irf8")
+    GMP = c("Elane", "Mpo")
+    NEUTRO_TF = c("Spi1", "Cebpe")
+    NEUTRO = c("Camp", "Ltf", "Retnlg")
+    NK_TF = c("Ets1", "Foxo1", "Runx3")
+    NK = c("Skap1", "Ccl5", "Id2")
+    BASO_TF = c("Lmo4", "Runx1", "Stat5b")
+    BASO = c("Hdc", "Cd200r3", "Prss34")
+    Cell.cycle = c("Nusap1", "Top2a", "Mki67")
+    MIXED_RB = c("Ncl", "Npm1", "Cmss1")
+    MIXED_TI = c("Eif4b", "Eif4a1", "Eif2s2", "Pdcd4")
+    MIXED_NM = c("Nme1", "Dctpp1")
+    MIXED_PC = c("Hsp90aa1", "Hsp90ab1")
+
+features <- list("MK TF" = MK_TF, "MK_GRANULES" = MK_GRANULES, "MK_SIGNALING" = MK_SIGNALING, "MK_SURFACE" = MK_SURFACE, "ERY_TF" = ERY_TF, "GMP_TF" = GMP_TF,"GMP"=GMP,"NEUTRO_TF" = NEUTRO_TF,"NEUTRO" = NEUTRO, "NK_TF"=NK_TF,"NK" = NK,"BASO_TF" = BASO_TF,"BASO" = BASO, "Cell.cycle" = Cell.cycle,"MIXED_RB"=MIXED_RB,"MIXED_TI" = MIXED_TI, "MIXED_NM" = MIXED_NM, "MIXED_PC" = MIXED_PC)
+DotPlot(object = MKP3HTO, features=features, cluster.idents=T, cols.use = tsne_colors, plot.legend = F, x.lab.rot = T) + theme(axis.text.x = element_text(angle = 90))
+
+```
+
+# monocle3 pseudotime analysis for the MKP clusters namely: MK_MEP_cycling, MK-MEP, Early_MKP, Mixed_progenitors, Late_MKP. The UMAP of the original seurat object is preserved by converting the seurat object into the corresponding cds object. The cells are ordered in pseudotime by selecting the cluster 3 or the MK-MEP_cycling cluster as the initial/root cluster based on biological knowledge.Graph test function's principal graph method was used to identify the DE genes along pseudotime. Finally, we plotted a heatmap to showcase the 6 groups (k means = 6) of genes that are DE along pseudotime and attached a line graph to show the proportion of cells belonging to each condition over pseudotime.
+```{r pseudotime, echo=TRUE}
+
+
+
+MKP3HTO$Idents = Idents(MKP3HTO)
+MKP3HTO <- subset(MKP3HTO, idents = c("Mixed_progenitors","Late_MKP","MK-MEP","MK-MEP_cycling","Early_MKP"))
+
+cds <- SeuratWrappers::as.cell_data_set(MKP3HTO)
+cds
+
+# to get cell metadata
+colData(cds)
+# to gene metdata
+fData(cds)
+rownames(fData(cds))[1:10]
+
+# since it misses the gene_short_name column, let's add it
+fData(cds)$gene_short_name <- rownames(fData(cds))
+
+# to get counts
+counts(cds)
+
+
+
+# ...2. Cluster cells (using clustering info from seurat's UMAP)---------------------------
+# let's use the clustering information have
+
+# assign paritions
+reacreate.partition <- c(rep(1,length(cds@colData@rownames)))
+names(reacreate.partition) <- cds@colData@rownames
+reacreate.partition <- as.factor(reacreate.partition)
+
+
+cds@clusters$UMAP$partitions <- reacreate.partition
+
+# Assign the cluster info 
+
+list_cluster <- MKP3HTO@active.ident
+cds@clusters$UMAP$clusters <- list_cluster
+
+
+# Assign UMAP coordinate - cell embeddings
+
+cds@int_colData@listData$reducedDims$UMAP <- MKP3HTO@reductions$umap@cell.embeddings
+
+
+
+# plot
+
+cluster.before.trajectory <- plot_cells(cds,
+                                        color_cells_by = 'cluster',
+                                        label_groups_by_cluster = FALSE,
+                                        label_leaves=FALSE,
+                                        label_branch_points=FALSE,
+                                        group_label_size = 5) +
+  theme(legend.position = "right")
+save_plot(cluster.before.trajectory, "/mnt/raidtmp/Alejandro/velocyto_florian/FINAL/cluster", 12, 8)  
+
+
+cluster.names <- plot_cells(cds,
+                            color_cells_by = "partition",
+                            label_groups_by_cluster = FALSE,
+                            group_label_size = 5) +
+  theme(legend.position = "right")
+save_plot(cluster.names, "/mnt/raidtmp/Alejandro/velocyto_florian/FINAL/cluster_partition", 12, 8)  
+
+
+
+
+# ...3. Learn trajectory graph ------------------------
+cds <- learn_graph(cds, use_partition = FALSE)
+
+p = plot_cells(cds,
+               color_cells_by = 'Idents',
+               label_groups_by_cluster = FALSE,
+               label_branch_points = FALSE,
+               label_roots = FALSE,
+               label_leaves = FALSE,
+               group_label_size = 5)
+save_plot(p, "/mnt/raidtmp/Alejandro/velocyto_florian/FINAL/cluster_graph", 12, 8)  
+
+
+
+# ...4. Order the cells in pseudotime -------------------
+
+cds <- order_cells(cds, reduction_method = 'UMAP', root_cells = colnames(cds[,clusters(cds) == "MK-MEP_cycling"]))
+
+p = plot_cells(cds,
+               color_cells_by = 'pseudotime',
+               label_groups_by_cluster = FALSE,
+               label_branch_points = FALSE,
+               label_roots = FALSE,
+               label_leaves = FALSE)
+save_plot(p, "/mnt/raidtmp/Alejandro/velocyto_florian/FINAL/pseudotimex", 12, 8)  
+
+
+
+# cells ordered by monocle3 pseudotime
+
+
+pseudotime(cds)
+cds$monocle3_pseudotime <- pseudotime(cds)
+data.pseudo <- as.data.frame(colData(cds))
+
+
+# use graph test function to find DE genes along pseudotime
+modulated_genes <- graph_test(cds, neighbor_graph = "principal_graph", cores = 4)
+genes <- row.names(subset(modulated_genes, q_value < 0.05 & morans_I > 0.25))
+genes
+
+pt.matrix <- cds@assays@data$scaledata[match(genes,rownames(rowData(cds))),order(pseudotime(cds))]
+pseudos <- sort(t(as.matrix(pseudotime(cds))))
+pt.matrix <- t(apply(pt.matrix,1,function(x){smooth.spline(pseudos,y=x,df=3)$y}))
+
+
+pt.matrix <- t(apply(pt.matrix,1,function(x){(x-mean(x))/sd(x)}))
+rownames(pt.matrix) <- genes;
+#create a heatmap with K means with 6 groups to identify 6 groups of genes that are DE along pseudotime
+htkm <- Heatmap(
+  pt.matrix,
+  name                         = "z-score",
+  col                          = colorRamp2(seq(from=-2,to=2,length=11),rev(brewer.pal(11, "Spectral"))),
+  show_row_names               = TRUE,
+  show_column_names            = FALSE,
+  row_names_gp                 = gpar(fontsize = 6),
+  km = 6,
+  row_title_rot                = 0,
+  cluster_rows                 = TRUE,
+  cluster_row_slices           = FALSE,
+  cluster_columns              = FALSE)
+
+print(htkm)
+
+```
+
+# the next chunk of code creates a proportion of cells per condition along the pseudotime
+
+```{r lib}
+## reading in input
+
+
+no_xaxis <- theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+
+## Load the pseudotime results
+
+pt <- read.csv("pseudotime_df.csv")
+# remove the pDC-depletion hashtagged cells from the pseudotime analysis
+pt_ordered <- pt[order(pt$monocle3_pseudotime),] %>% filter(CSclassification != "pDC-depletion" & !is.na(ident) & ident != "NA" & !is.na(CSclassification))
+
+pt_ordered$ident <- factor(pt_ordered$ident)
+pt_ordered$CSclassification <- factor(pt_ordered$CSclassification)
+
+
+#Create a plot of cell type abundance along the time axis. For this we conisder time windows of -50 to +50 cells
+
+offset <- 50
+counts <- bind_rows(lapply(offset + seq(1, nrow(pt_ordered) - offset, by=10), function(i) {
+  idx <- (i - offset):(i + offset)
+  len <- length(idx)
+  pt_ordered[idx,] %>% group_by(ident, CSclassification, .drop = FALSE) %>%
+    summarize(n=n()) %>% mutate(bin_len=len, time_idx=i)
+}))
+
+
+# Also get the overall counts of each library for noramlization
+
+overall_counts <- pt_ordered %>% group_by(CSclassification) %>% summarize(overall_n=n())
+
+F
+#Join the counts and overall counts and compute percentages
+
+joined <- counts %>% inner_join(overall_counts) %>% mutate(prop=n/overall_n, facet_label=gsub("-", "\n", CSclassification)) %>% filter(!is.na(ident))
+p <- ggplot(aes(x=time_idx, y=prop, col=ident), data=joined) + scale_x_continuous(limits=c(0, nrow(pt_ordered))) + geom_line() + facet_grid(facet_label~.) + theme(legend.position="top") + theme(strip.text.y.right = element_text(angle = 0)) + labs(y="Proportion", col="Cell type")
+print(p)
+ggsave(filename="proportion_by_pseudotime.pdf", p + no_xaxis, width=10, height=3, units = "in")
+```
+
+
+
+
+
+
+
