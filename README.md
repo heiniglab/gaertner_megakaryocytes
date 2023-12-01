@@ -24,7 +24,7 @@ Clone the GitHub Repository:
 Use Git to clone the repository to your local machine. 
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/heiniglab/gaertner_megakaryocytes/
 cd path-to-repo
 ```
 
