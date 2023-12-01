@@ -38,4 +38,7 @@ This command will install all the R packages specified in the renv.lock file.
 
 
 # Tutorial
-We presented our code as a R Markdown script with two HTML pages generated from the Markdown. All you need to do is download the seurat object we presented in the Zenodo repository (https://doi.org/10.5281/zenodo.10245736), link the location of the seurat object (final_MKP3HTO.Rds) in the script,and run the Markdown script till the end.
+We presented our code used for generating the figures in the manuscript as a R Markdown script in the Tutorial folder with two HTML pages generated from the Markdown. All you need to do is download the seurat object we presented in the Zenodo repository (https://doi.org/10.5281/zenodo.10245736), link the location of the seurat object (final_MKP3HTO.Rds) in the script,and run the Markdown script till the end.
+
+# Script
+The complete script for the analysis is also presented in a R markdown file called final_script. This script details the analysis from reading in the 10x output raw files, creating a seurat object, filtering, normalising, and scaling data, cluster analysis, differential expression analysis, to monocle 3 trajectory analysis.
