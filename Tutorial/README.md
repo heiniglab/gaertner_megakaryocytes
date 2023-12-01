@@ -29,7 +29,7 @@ Run the Knit Script: Execute the knit_script.R script to automatically knit the 
 Rscript knit_script.R
 ```
 
-This command will generate an HTML document that includes the analysis results.
+This command will generate an HTML document that includes the analysis results. Run Time: 20 mins
 View the Results: After the script has finished running, find and open the generated document (e.g., an HTML file) in the same directory to view the results of the analysis.
 
 # Customizing File Paths (Optional)
