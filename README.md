@@ -5,5 +5,37 @@ This repository contains all code to reproduce results of the RNA-seq and scRNA-
 
 Gärtner *et al.* **Plasmacytoid dendritic cells regulate tissue homeostasis of megakaryocytes**
 
-The dependencies of the script are presented in renv.lock file
+# Data availability
+The seurat object analysed in this project are available in the Zenodo repository
 
+# Installation instructions
+Installation Instructions Using renv.lock
+This project uses renv for R package management to ensure reproducibility. Follow these steps to set up the project environment:
+
+Install renv:
+
+Open R or RStudio.
+Run the following command to install renv:
+
+```{R}
+install.packages("renv")
+```
+Clone the GitHub Repository:
+Use Git to clone the repository to your local machine. 
+
+```bash
+git clone <repo-url>
+cd path-to-repo
+```
+
+Restoring the Environment:
+Inside the R console (in the project directory), run the following command to restore the environment from the renv.lock file:
+
+```{R}
+renv::restore()
+```
+This command will install all the R packages specified in the renv.lock file.
+
+
+# Tutorial
+We presented our code as a R Markdown script with two HTML pages generated from the Markdown. All you need to do is download the seurat object we presented in the Zenodo repository, link the location of the object in the script,and run the Markdown script till the end.
